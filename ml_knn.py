@@ -45,7 +45,7 @@ def get_folds(y, n_folds: int, random_state: int):
     return y_drugs[['sig_id', 'fold']]
 
 
-def log_loss_score(X, y, v, n_folds=5, random_state=42, n_neighbors=1000):
+def oof_probas(X, y, v, n_folds=5, random_state=42, n_neighbors=1000):
     # First scale inputs
     X_scaled = StandardScaler().fit_transform(X.iloc(axis=1)[3:].values)
     X_scaled = np.hstack([X.iloc(axis=1)[:3].values, X_scaled])
@@ -57,16 +57,16 @@ def log_loss_score(X, y, v, n_folds=5, random_state=42, n_neighbors=1000):
     oof = np.zeros((X.shape[0], 206))
     for fold in range(n_folds):
         fold_idx = df_fold[df_fold['fold'] != fold].index
-        model = KNeighborsClassifier(n_neighbors=n_neighbors)
-        model.fit(
-            X_scaled[fold_idx][:, v],
-            y.iloc[fold_idx].values[:, 1:])
-        pp = model.predict_proba(X_scaled[fold_idx][:, v])
-        pp = np.stack([(1 - pp[x][:, 0]) for x in range(len(pp))]).T
-        oof[fold_idx, ] = pp
+        pp_fold = df_fold[df_fold['fold'] == fold].index
 
-    # Return the accumulated log loss score across all folds
-    return log_loss(y.iloc[:, 1:].values.flatten(), oof.flatten())
+        model = KNeighborsClassifier(n_neighbors=n_neighbors)
+        model.fit(X_scaled[fold_idx][:, v], y.iloc[fold_idx].values[:, 1:])
+
+        pp = model.predict_proba(X_scaled[pp_fold][:, v])
+        pp = np.stack([(1 - pp[x][:, 0]) for x in range(len(pp))]).T
+        oof[pp_fold, ] = pp
+
+    return oof
 
 
 def mutation(x):
@@ -77,53 +77,122 @@ def mutation(x):
 
 
 class GeneticAlgorithm:
-    def __init__(self, n_folds=5, random_state=42, n_neighbors=1000):
+    def __init__(self, population, n_folds=5, random_state=42, n_neighbors=1000):
         self.n_folds = n_folds
         self.random_state = random_state
         self.n_neighbors = n_neighbors
+        self.population = population
 
-    def fit(self, X, y, population, generations=20, n_parents=102, cross_over=0.5, mutation_rate=0.1):
+    def fit(self, X, y, generations=20, cross_over=0.5, mutation_rate=0.1):
         warnings.simplefilter(action='ignore', category=FutureWarning)
-        print('Fitting {} generations...'.format(str(generations)))
+        print('Fitting {} generations...'.format(str(generations)), '\n')
+
         for generation in range(generations):
-            print('GENERATION:', generation+1)
+            print('=========== GENERATION', generation+1, '=========== \n', 'Computing log loss scores...')
             fitness_scores = []
-            print('Computing log loss scores...')
-            for sample in tqdm(population):
+
+            for sample in tqdm(self.population):
+                prediction_probas = oof_probas(X, y, sample, n_folds=self.n_folds,
+                                               random_state=self.random_state, n_neighbors=self.n_neighbors)
                 fitness_scores.append(
-                    log_loss_score(X, y, sample,
-                                   n_folds=self.n_folds,
-                                   random_state=self.random_state,
-                                   n_neighbors=self.n_neighbors))
+                    log_loss(y.iloc[:, 1:].values.flatten(), prediction_probas.flatten()))
 
             # Smallest log loss values to select parents
-            smallest_idx = np.argsort(fitness_scores)[:n_parents]
-            parents = np.array([population[i] for i in smallest_idx])
-            lonely_parents = smallest_idx[n_parents:n_parents + 2]
+            print('Selecting best parents...')
+            n_parents = len(fitness_scores) // 2
+            sorted_idx = np.argsort(fitness_scores)[:n_parents]
+            parents = np.array([self.population[i] for i in sorted_idx])
 
             # Create offspring
-            print('Generating offspring...')
-            offspring_shape = (population.shape[0] - n_parents, population.shape[1])
+            print('Generating offspring...\n')
+            offspring_shape = (self.population.shape[0] - n_parents, self.population.shape[1])
             offspring = np.ndarray(offspring_shape)
-            cross_over_point = int(1//cross_over)
+            cross_over_point = int(offspring.shape[1] * cross_over)
             for i in range(offspring.shape[0]):
                 parent1_idx = i % parents.shape[0]
                 parent2_idx = (i + 1) % parents.shape[0]
                 offspring[i, :cross_over_point] = parents[parent1_idx, :cross_over_point]
                 offspring[i, cross_over_point:] = parents[parent2_idx, cross_over_point:]
 
-                for j in range(len(offspring)):
+                for j in range(len(offspring[i])):
                     if mutation(mutation_rate):
-                        if offspring[j]:
-                            offspring[j] = False
+                        if offspring[i, j]:
+                            offspring[i, j] = False
                         else:
-                            offspring[j] = True
+                            offspring[i, j] = True
 
-            population[:parents.shape[0], :] = parents
-            population[parents.shape[0]:parents.shape[0]+2, :] = lonely_parents
-            population[parents.shape[0]+2:, :] = offspring
-            print('\n')
-        return population
+            self.population[:parents.shape[0], :] = parents
+            self.population[parents.shape[0]:, :] = offspring
+        print('Evolution complete.')
+
+
+class EnsembleClassifier:
+    def __init__(self, feature_set):
+        self.feature_set = feature_set
+        self.prediction_probas = None
+        self.weights = None
+
+    def fit(self, X, y, generations=100, solution_per_population=50,
+                      n_mutations=2, n_folds=5, random_state=42, n_neighbors=1000):
+        warnings.simplefilter(action='ignore', category=FutureWarning)
+        log_losses = []
+        prediction_probas = []
+        for feature_subset in self.feature_set[:len(self.feature_set) // 2]:
+            prediction_proba = oof_probas(
+                X, y, feature_subset,  n_folds=n_folds, random_state=random_state, n_neighbors=n_neighbors)
+            prediction_probas.append(prediction_proba)
+            log_losses.append(log_loss(y.iloc[:, 1:].values.flatten(), prediction_proba.flatten()))
+
+        log_losses = np.array(log_losses)
+
+        # Implement GA for ensemble weighting scores
+        population_size = (solution_per_population, len(log_losses))
+        weights = np.random.uniform(0.0, 1.0, size=population_size)
+        weights = weights / weights.sum(axis=1)[:, None]  # sums to one
+
+        n_parents = solution_per_population // 2
+
+        for generation in range(generations):
+            fitness = np.sum(weights * log_losses, axis=1)
+            smallest_idx = np.argsort(fitness)[:n_parents]
+            parents = np.array([weights[i] for i in smallest_idx])
+
+            offspring_shape = (weights.shape[0] - n_parents, weights.shape[1])
+            offspring = np.ndarray(offspring_shape)
+            crossover_point = offspring.shape[1] // 2
+
+            for k in range(offspring.shape[0]):
+                parent1_idx = k % parents.shape[0]
+                parent2_idx = (k + 1) % parents.shape[0]
+                offspring[k, :crossover_point] = parents[parent1_idx, :crossover_point]
+                offspring[k, crossover_point:] = parents[parent2_idx, crossover_point:]
+
+            mutations_counter = offspring.shape[1] // n_mutations
+            for idx in range(offspring.shape[0]):
+                gene_idx = mutations_counter - 1
+                for mutation_num in range(n_mutations):
+                    random_value = np.random.uniform(0.0, 0.1, 1)
+                    offspring[idx, gene_idx] = offspring[idx, gene_idx] + random_value
+                    gene_idx = gene_idx + mutations_counter
+
+            weights[:parents.shape[0], :] = parents
+            weights[parents.shape[0]:, :] = offspring
+            weights = weights / weights.sum(axis=1)[:, None]  # sums to one
+
+        self.prediction_probas = np.array(prediction_probas)
+        self.weights = weights
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
