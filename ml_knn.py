@@ -4,6 +4,8 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from cuml.neighbors import KNeighborsClassifier
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import StandardScaler
+import warnings
+from tqdm.notebook import tqdm
 
 DRUGS = pd.read_csv('train_drug.csv')
 
@@ -80,15 +82,50 @@ class GeneticAlgorithm:
         self.random_state = random_state
         self.n_neighbors = n_neighbors
 
-    def fit(self, X, y, population, generations=100, parents=0.5, cross_over=0.5, mutation_rate=0.1):
+    def fit(self, X, y, population, generations=20, n_parents=102, cross_over=0.5, mutation_rate=0.1):
+        warnings.simplefilter(action='ignore', category=FutureWarning)
+        print('Fitting {} generations...'.format(str(generations)))
         for generation in range(generations):
+            print('GENERATION:', generation+1)
             fitness_scores = []
-            for sample in population:
+            print('Computing log loss scores...')
+            for sample in tqdm(population):
                 fitness_scores.append(
                     log_loss_score(X, y, sample,
                                    n_folds=self.n_folds,
                                    random_state=self.random_state,
                                    n_neighbors=self.n_neighbors))
+
+            # Smallest log loss values to select parents
+            smallest_idx = np.argsort(fitness_scores)[:n_parents]
+            parents = np.array([population[i] for i in smallest_idx])
+            lonely_parents = smallest_idx[n_parents:n_parents + 2]
+
+            # Create offspring
+            print('Generating offspring...')
+            offspring_shape = (population.shape[0] - n_parents, population.shape[1])
+            offspring = np.ndarray(offspring_shape)
+            cross_over_point = int(1//cross_over)
+            for i in range(offspring.shape[0]):
+                parent1_idx = i % parents.shape[0]
+                parent2_idx = (i + 1) % parents.shape[0]
+                offspring[i, :cross_over_point] = parents[parent1_idx, :cross_over_point]
+                offspring[i, cross_over_point:] = parents[parent2_idx, cross_over_point:]
+
+                for j in range(len(offspring)):
+                    if mutation(mutation_rate):
+                        if offspring[j]:
+                            offspring[j] = False
+                        else:
+                            offspring[j] = True
+
+            population[:parents.shape[0], :] = parents
+            population[parents.shape[0]:parents.shape[0]+2, :] = lonely_parents
+            population[parents.shape[0]+2:, :] = offspring
+            print('\n')
+        return population
+
+
 
 
 
