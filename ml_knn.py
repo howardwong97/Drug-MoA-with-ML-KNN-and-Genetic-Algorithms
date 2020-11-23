@@ -5,9 +5,10 @@ from cuml.neighbors import KNeighborsClassifier
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import StandardScaler
 import warnings
-from tqdm.notebook import tqdm
+from tqdm.notebook import tqdm, trange
 
 DRUGS = pd.read_csv('train_drug.csv')
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 def get_folds(y, n_folds: int, random_state: int):
@@ -69,13 +70,6 @@ def oof_probas(X, y, v, n_folds=5, random_state=42, n_neighbors=1000):
     return oof
 
 
-def mutation(x):
-    if np.random.rand(1) < x:
-        return True
-    else:
-        return False
-
-
 class GeneticAlgorithm:
     def __init__(self, population, n_folds=5, random_state=42, n_neighbors=1000):
         self.n_folds = n_folds
@@ -83,8 +77,7 @@ class GeneticAlgorithm:
         self.n_neighbors = n_neighbors
         self.population = population
 
-    def fit(self, X, y, generations=20, cross_over=0.5, mutation_rate=0.1):
-        warnings.simplefilter(action='ignore', category=FutureWarning)
+    def fit(self, X, y, generations=20, cross_over=0.5, mutation_rate=0.05):
         print('Fitting {} generations...'.format(str(generations)), '\n')
 
         for generation in range(generations):
@@ -114,8 +107,9 @@ class GeneticAlgorithm:
                 offspring[i, :cross_over_point] = parents[parent1_idx, :cross_over_point]
                 offspring[i, cross_over_point:] = parents[parent2_idx, cross_over_point:]
 
+                # Mutation involves randomly flipping booleans with a 5% chance
                 for j in range(len(offspring[i])):
-                    if mutation(mutation_rate):
+                    if np.random.rand(1) <= mutation_rate:
                         if offspring[i, j]:
                             offspring[i, j] = False
                         else:
@@ -127,32 +121,46 @@ class GeneticAlgorithm:
 
 
 class EnsembleClassifier:
-    def __init__(self, feature_set):
+    def __init__(self, feature_set, n_ensemble=10):
         self.feature_set = feature_set
         self.prediction_probas = None
         self.weights = None
+        self.n_ensemble = n_ensemble
+        self.weighted_predictions = None
+        self.ensemble_log_loss = None
 
-    def fit(self, X, y, generations=100, solution_per_population=50,
-                      n_mutations=2, n_folds=5, random_state=42, n_neighbors=1000):
-        warnings.simplefilter(action='ignore', category=FutureWarning)
+    def fit(self, X, y, max_generations=1000, solution_per_population=100, mutation_rate=0.05, eps=1e-20, n_folds=5,
+            random_state=42, n_neighbors=1000, verbose=True):
+
         log_losses = []
         prediction_probas = []
-        for feature_subset in self.feature_set[:len(self.feature_set) // 2]:
+
+        if verbose:
+            print('Fitting {} models...'.format(str(self.n_ensemble)))
+
+        for feature_subset in tqdm(self.feature_set[:self.n_ensemble]):
             prediction_proba = oof_probas(
                 X, y, feature_subset,  n_folds=n_folds, random_state=random_state, n_neighbors=n_neighbors)
             prediction_probas.append(prediction_proba)
             log_losses.append(log_loss(y.iloc[:, 1:].values.flatten(), prediction_proba.flatten()))
 
+        self.prediction_probas = np.array(prediction_probas)
         log_losses = np.array(log_losses)
 
+        if verbose:
+            print('Running ensemble weight scoring optimization...')
+
         # Implement GA for ensemble weighting scores
-        population_size = (solution_per_population, len(log_losses))
-        weights = np.random.uniform(0.0, 1.0, size=population_size)
-        weights = weights / weights.sum(axis=1)[:, None]  # sums to one
+        population_size = (solution_per_population, self.n_ensemble)
+        weights = np.random.uniform(0.0, 1.0, size=population_size)  # randomly initialize weights
+        weights = weights / weights.sum(axis=1)[:, None]  # normalize to enforce summing to one
 
+        tmp_weights = weights.copy()
         n_parents = solution_per_population // 2
+        gen_counter = 0
 
-        for generation in range(generations):
+        for _ in range(max_generations):
+            gen_counter += 1
             fitness = np.sum(weights * log_losses, axis=1)
             smallest_idx = np.argsort(fitness)[:n_parents]
             parents = np.array([weights[i] for i in smallest_idx])
@@ -167,20 +175,35 @@ class EnsembleClassifier:
                 offspring[k, :crossover_point] = parents[parent1_idx, :crossover_point]
                 offspring[k, crossover_point:] = parents[parent2_idx, crossover_point:]
 
-            mutations_counter = offspring.shape[1] // n_mutations
-            for idx in range(offspring.shape[0]):
-                gene_idx = mutations_counter - 1
-                for mutation_num in range(n_mutations):
-                    random_value = np.random.uniform(0.0, 0.1, 1)
-                    offspring[idx, gene_idx] = offspring[idx, gene_idx] + random_value
-                    gene_idx = gene_idx + mutations_counter
+                x = np.random.uniform(0, 1, offspring.shape[1])
+                mutation_idx = np.where(x < mutation_rate)[0]
+                offspring[k, mutation_idx] = np.random.uniform(0, 1, len(mutation_idx)) ** 2.0
 
-            weights[:parents.shape[0], :] = parents
-            weights[parents.shape[0]:, :] = offspring
-            weights = weights / weights.sum(axis=1)[:, None]  # sums to one
+            tmp_weights[:parents.shape[0], :] = parents
+            tmp_weights[parents.shape[0]:, :] = offspring
+            tmp_weights = tmp_weights / tmp_weights.sum(axis=1)[:, None]  # sums to one
 
-        self.prediction_probas = np.array(prediction_probas)
-        self.weights = weights
+            if (np.abs(tmp_weights - weights) < eps).all():
+                self.weights = tmp_weights[0]
+                print('Threshold achieved in {} generations.\n'.format(str(gen_counter)))
+                break
+            else:
+                weights = tmp_weights
+
+        if gen_counter == max_generations:
+            self.weights = tmp_weights[0]
+            if verbose:
+                print("Max iterations reached without convergence.\n")
+
+        self.weighted_predictions = self.prediction_probas.T.dot(self.weights).T
+        self.ensemble_log_loss = log_loss(y.iloc[:, 1:].values.flatten(), self.weighted_predictions.flatten())
+
+        if verbose:
+            print('Final log loss:', str(self.ensemble_log_loss))
+
+
+
+
 
 
 
