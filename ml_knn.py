@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 from tqdm.notebook import tqdm, trange
 
-DRUGS = pd.read_csv('train_drug.csv')
+DRUGS = pd.read_csv('kaggle_data/train_drug.csv')
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
